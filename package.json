@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@paytaca/wizardconnect-vue": "^0.2.2",
     "vue": "^3.5.42"
   },
   "devDependencies": {

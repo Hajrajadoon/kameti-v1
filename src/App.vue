@@ -1,4 +1,5 @@
 <script setup>
+   import WalletConnect from './components/WalletConnect.vue';
 import { ref, computed } from 'vue';
 import { bchToSats, satsToBch, validate, createCircle, encodeCircle, decodeCircle } from './circle.js';
 
@@ -37,7 +38,7 @@ function addMember() {
   <main style="max-width:720px;margin:2rem auto;padding:0 1rem;font-family:system-ui">
     <h1>Kameti.cash</h1>
     <p>Interest-free savings circle. No custody, no fees, public proof on Bitcoin Cash.</p>
-
+   <WalletConnect />
     <form v-if="!circle" @submit.prevent="create">
       <input v-model="name" placeholder="Circle name" required />
       <label>Amount per member (BCH) <input v-model="amountBch" /></label>
