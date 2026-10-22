@@ -1,4 +1,3 @@
-
 <script setup>
 import { ref, watch, onBeforeUnmount } from 'vue'
 import {
@@ -12,6 +11,7 @@ import {
   scanWallet,
   formatBch,
 } from '../chain.js'
+  import TestPayment from './TestPayment.vue'
 
 const {
   state,
@@ -266,6 +266,12 @@ onBeforeUnmount(() => {
           No ordinary BCH outputs were found in the scanned addresses.
         </p>
       </section>
+        <TestPayment
+    v-if="totalSats !== null && coins.length"
+    :manager="manager"
+    :coins="coins"
+    @sent="checkBalance"
+  />
 
       <button @click="handleDisconnect">
         Disconnect
