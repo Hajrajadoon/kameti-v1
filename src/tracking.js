@@ -91,7 +91,7 @@ export async function trackPayments(circle, rounds, id) {
       for (const note of info.notes) {
         if (note[0] !== NOTE_TAG || note[1] !== id || Number(note[2]) !== round.round) continue
         const payer = Number(note[3])
-        if (!Number.isInteger(payer) || payer < 1 || payer > n || payer - 1 === r) continue
+               if (!Number.isInteger(payer) || payer < 1 || payer > n || payer === round.recipientNo) continue
 
         let received = 0n
         for (const o of info.outputs) if (o.lockingHex === recipientHex) received += o.sats

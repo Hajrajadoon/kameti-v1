@@ -1,31 +1,78 @@
 <script setup>
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { wallet } from '../store.js'
 import { deriveAddress, scanWallet, formatBch } from '../chain.js'
 import { sendPayment } from '../payment.js'
 import { circleId, getRounds } from '../circle.js'
 import { trackPayments, isLate } from '../tracking.js'
+import { getHeight, getBlockHash, drawOrder, DRAW_CONFIRMATIONS } from '../draw.js'
 import { NETWORK } from '../config.js'
 
 const props = defineProps({
   circle: { type: Object, required: true },
 })
+defineEmits(['demo-copy'])
 
 // Safety cap per payment. Raise it deliberately before real use on mainnet.
 const MAX_CIRCLE_SATS = 5_000_000n // 0.05 BCH
 
-const payerIndex = ref(-1) // which member the connected wallet belongs to
+const meIdx = ref(-1) // position of the connected wallet in the shared member list, -1 = unknown
 const busyRound = ref(null)
 const errorText = ref('')
 const lastTx = ref('')
 let controller = null
 
-const paid = ref([]) // paid[roundIndex][payerNumber] = { txid, height }
+const paid = ref([]) // paid[roundIndex][memberNumber] = { txid, height }
 const tracking = ref(false)
 const trackError = ref('')
 const lastTracked = ref('')
+const circleIdText = ref('')
 
-const rounds = computed(() => getRounds(props.circle))
+// ----- dice draw -----
+const hasDraw = computed(
+  () => Number.isInteger(props.circle.drawHeight) && props.circle.drawHeight > 0,
+)
+const drawStatus = ref(hasDraw.value ? 'loading' : 'none') // none | loading | pending | ready | error
+const drawError = ref('')
+const currentHeight = ref(0)
+const blockHash = ref('')
+const seq = ref(null)
+let drawTimer = null
+
+const orderReady = computed(() => !hasDraw.value || drawStatus.value === 'ready')
+const remainingBlocks = computed(() =>
+  Math.max(0, props.circle.drawHeight + DRAW_CONFIRMATIONS - currentHeight.value),
+)
+
+async function loadDraw() {
+  if (!hasDraw.value) return
+  try {
+    drawError.value = ''
+    const height = await getHeight()
+    currentHeight.value = height
+    if (height < props.circle.drawHeight + DRAW_CONFIRMATIONS) {
+      drawStatus.value = 'pending'
+      return
+    }
+    const hash = await getBlockHash(props.circle.drawHeight)
+    const id = await circleId(props.circle)
+    seq.value = await drawOrder(hash, id, props.circle.members.length)
+    blockHash.value = hash
+    drawStatus.value = 'ready'
+    if (drawTimer) {
+      clearInterval(drawTimer)
+      drawTimer = null
+    }
+    detectMe()
+    refreshStatus()
+  } catch (e) {
+    console.error('Draw failed:', e)
+    drawStatus.value = 'error'
+    drawError.value = e?.message || String(e)
+  }
+}
+
+const rounds = computed(() => getRounds(props.circle, seq.value))
 
 const currentRoundIndex = computed(() => {
   const now = Date.now()
@@ -36,28 +83,35 @@ const currentRoundIndex = computed(() => {
   return idx
 })
 
-const canPay = computed(() => wallet.ready && payerIndex.value >= 0 && busyRound.value === null)
+const canPay = computed(
+  () => wallet.ready && meIdx.value >= 0 && busyRound.value === null && orderReady.value,
+)
 
-// 'self' | 'paid' | 'late' | 'pending'
-function cellStatus(roundIdx, memberIdx) {
-  if (roundIdx === memberIdx) return 'self'
-  if (paid.value[roundIdx]?.[memberIdx + 1]) return 'paid'
-  return isLate(rounds.value[roundIdx].dueDate) ? 'late' : 'pending'
+// 'self' | 'paid' | 'late' | 'pending' for a member number in a round
+function statusFor(roundIdx, memberNo) {
+  const round = rounds.value[roundIdx]
+  if (round.recipientNo === memberNo) return 'self'
+  if (paid.value[roundIdx]?.[memberNo]) return 'paid'
+  return isLate(round.dueDate) ? 'late' : 'pending'
 }
+
+// Columns of the status grid follow the payout order
+const cellStatus = (roundIdx, colIdx) => statusFor(roundIdx, rounds.value[colIdx].recipientNo)
 
 function paidCount(roundIdx) {
   return Object.keys(paid.value[roundIdx] || {}).length
 }
 
-const myPayments = computed(() =>
-  payerIndex.value < 0
-    ? []
-    : rounds.value
-        .map((r, i) => ({ ...r, idx: i, status: cellStatus(i, payerIndex.value) }))
-        .filter(r => r.idx !== payerIndex.value),
-)
+const myPayments = computed(() => {
+  if (meIdx.value < 0 || !orderReady.value) return []
+  const no = meIdx.value + 1
+  return rounds.value
+    .map((r, i) => ({ ...r, idx: i, status: statusFor(i, no) }))
+    .filter(r => r.status !== 'self')
+})
 
 async function refreshStatus() {
+  if (!orderReady.value) return
   tracking.value = true
   trackError.value = ''
   try {
@@ -72,8 +126,6 @@ async function refreshStatus() {
   }
 }
 
-onMounted(refreshStatus)
-
 function detectMe() {
   const m = wallet.manager
   if (!m) return
@@ -85,17 +137,35 @@ function detectMe() {
       // skip addresses that cannot be derived
     }
   }
-  payerIndex.value = props.circle.members.findIndex(mem => mine.has(mem.address.toLowerCase()))
+  meIdx.value = props.circle.members.findIndex(mem => mine.has(mem.address.toLowerCase()))
 }
 
 watch(
   () => wallet.ready,
   ready => {
     if (ready) detectMe()
-    else payerIndex.value = -1
+    else meIdx.value = -1
   },
   { immediate: true },
 )
+
+onMounted(async () => {
+  circleIdText.value = await circleId(props.circle)
+  if (hasDraw.value) {
+    await loadDraw()
+    if (drawStatus.value !== 'ready') {
+      drawTimer = setInterval(() => {
+        if (drawStatus.value !== 'ready') loadDraw()
+      }, 60000)
+    }
+  } else {
+    refreshStatus()
+  }
+})
+
+onBeforeUnmount(() => {
+  if (drawTimer) clearInterval(drawTimer)
+})
 
 function cancel() {
   if (controller) controller.abort('Cancelled by user')
@@ -105,11 +175,15 @@ async function payRound(round) {
   errorText.value = ''
   lastTx.value = ''
 
+  if (!orderReady.value) {
+    errorText.value = 'The order has not been drawn yet.'
+    return
+  }
   if (!wallet.manager) {
     errorText.value = 'Connect your wallet first.'
     return
   }
-  if (payerIndex.value < 0) {
+  if (meIdx.value < 0) {
     errorText.value = 'Choose which member you are first.'
     return
   }
@@ -131,7 +205,7 @@ async function payRound(round) {
       `Kameti ${props.circle.name}: round ${round.round}`,
       controller.signal,
       {
-        opReturn: ['KAMETI', id, String(round.round), String(payerIndex.value + 1)],
+        opReturn: ['KAMETI', id, String(round.round), String(meIdx.value + 1)],
         maxSats: MAX_CIRCLE_SATS,
       },
     )
@@ -162,102 +236,182 @@ async function payRound(round) {
       Dates are in UTC.
     </p>
 
+    <p>
+      <small>
+        Order mode:
+        <strong v-if="circle.demo">instant demo draw</strong>
+        <strong v-else-if="hasDraw">blockchain draw at block {{ circle.drawHeight }}</strong>
+        <strong v-else>set by hand</strong>
+      </small>
+    </p>
+
+    <details class="verify" open>
+      <summary><strong>Check before you pay</strong> (circle id {{ circleIdText }})</summary>
+      <p>
+        <small>
+          Every member must see the <strong>same circle id</strong> and the same addresses below.
+          If your id differs from the group's, do not pay. Someone may have changed the link.
+        </small>
+      </p>
+      <ol>
+        <li v-for="(m, i) in circle.members" :key="i" style="overflow-wrap: anywhere">
+          {{ m.name }}: <code>{{ m.address }}</code>
+        </li>
+      </ol>
+    </details>
+
+    <div v-if="hasDraw" class="draw">
+      <h3>Order decided by the blockchain</h3>
+
+      <p v-if="circle.demo" style="color: #b45309">
+        <strong>Demo circle:</strong> the draw used a block that already existed, so an organizer
+        could choose the moment to get a favourable order. Use the normal draw for real circles.
+      </p>
+
+      <p v-if="drawStatus === 'loading'">Reading the blockchain...</p>
+
+      <div v-else-if="drawStatus === 'pending'">
+        <p>
+          The payout order is decided by block <strong>{{ circle.drawHeight }}</strong>
+          of the {{ NETWORK }} blockchain. Nobody can predict or control it.
+          Current block: {{ currentHeight }}. The draw runs in about
+          <strong>{{ remainingBlocks }}</strong> more blocks
+          (roughly {{ remainingBlocks * 10 }} minutes).
+        </p>
+        <p>
+          <strong>All members must open this link and check the list above before the draw.</strong>
+          If the list changes later, the order changes too, and everyone can see it.
+        </p>
+        <p>
+          <button @click="loadDraw">Check again</button>
+          <button v-if="!circle.demo" @click="$emit('demo-copy')">
+            Skip the wait: make an instant demo copy (demo only)
+          </button>
+        </p>
+      </div>
+
+      <div v-else-if="drawStatus === 'ready'">
+        <p>
+          Draw done with block {{ circle.drawHeight }}.
+          Block hash: <code style="overflow-wrap: anywhere">{{ blockHash }}</code>
+        </p>
+        <ol>
+          <li v-for="(r, i) in rounds" :key="r.round">
+            Roll {{ i + 1 }}: <strong>{{ r.recipient.name }}</strong> receives in round {{ r.round }}
+          </li>
+        </ol>
+        <p>
+          <small>
+            Anyone can repeat this draw from the block hash and the circle id
+            ({{ circleIdText }}) and will get the same order.
+          </small>
+        </p>
+      </div>
+
+      <div v-else-if="drawStatus === 'error'">
+        <p role="alert" style="color: #dc2626">Could not run the draw: {{ drawError }}</p>
+        <p><button @click="loadDraw">Try again</button></p>
+      </div>
+    </div>
+
     <div v-if="wallet.ready">
       <label>
         I am:
-        <select v-model.number="payerIndex">
+        <select v-model.number="meIdx">
           <option :value="-1">Choose your name...</option>
           <option v-for="(m, i) in circle.members" :key="i" :value="i">{{ m.name }}</option>
         </select>
       </label>
-      <p v-if="payerIndex < 0" style="color: #b45309">
+      <p v-if="meIdx < 0" style="color: #b45309">
         The connected wallet's address is not in this circle's member list. Pick who you are.
       </p>
     </div>
     <p v-else><small>Connect your wallet above to pay.</small></p>
 
-    <div v-if="payerIndex >= 0" class="owe">
-      <h3>You owe</h3>
-      <ul>
-        <li v-for="r in myPayments" :key="r.round">
-          Round {{ r.round }}: pay <strong>{{ r.recipient.name }}</strong>
-          {{ formatBch(r.amountSats) }} BCH by {{ r.dueDate.slice(0, 10) }}
-          <span v-if="r.status === 'paid'"> ✅ paid</span>
-          <span v-else-if="r.status === 'late'" style="color: #dc2626"> ⚠ late</span>
-        </li>
-      </ul>
-    </div>
+    <template v-if="orderReady">
+      <div v-if="meIdx >= 0" class="owe">
+        <h3>You owe</h3>
+        <ul>
+          <li v-for="r in myPayments" :key="r.round">
+            Round {{ r.round }}: pay <strong>{{ r.recipient.name }}</strong>
+            {{ formatBch(r.amountSats) }} BCH by {{ r.dueDate.slice(0, 10) }}
+            <span v-if="r.status === 'paid'"> ✅ paid</span>
+            <span v-else-if="r.status === 'late'" style="color: #dc2626"> ⚠ late</span>
+          </li>
+        </ul>
+      </div>
 
-    <h3>Rounds</h3>
-    <div style="overflow-x: auto">
-      <table border="1" cellpadding="6">
-        <thead>
-          <tr>
-            <th>Round</th>
-            <th>Receives</th>
-            <th>Pay by</th>
-            <th>Paid so far</th>
-            <th>Action</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="(r, i) in rounds" :key="r.round">
-            <td>{{ r.round }}<small v-if="i === currentRoundIndex"> (current)</small></td>
-            <td>{{ r.recipient.name }}</td>
-            <td>{{ r.dueDate.slice(0, 10) }}</td>
-            <td>
-              {{ paidCount(i) }} of {{ circle.members.length - 1 }}
-              ({{ formatBch(paidCount(i) * r.amountSats) }} BCH)
-            </td>
-            <td>
-              <span v-if="payerIndex === i">You receive this round</span>
-              <span v-else-if="payerIndex >= 0 && cellStatus(i, payerIndex) === 'paid'">✅ You paid</span>
-              <button v-else :disabled="!canPay" @click="payRound(r)">
-                {{ busyRound === r.round ? 'Waiting for wallet...' : 'Pay now' }}
-              </button>
-              <button v-if="busyRound === r.round" @click="cancel">Cancel</button>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
+      <h3>Rounds</h3>
+      <div style="overflow-x: auto">
+        <table border="1" cellpadding="6">
+          <thead>
+            <tr>
+              <th>Round</th>
+              <th>Receives</th>
+              <th>Pay by</th>
+              <th>Paid so far</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(r, i) in rounds" :key="r.round">
+              <td>{{ r.round }}<small v-if="i === currentRoundIndex"> (current)</small></td>
+              <td>{{ r.recipient.name }}</td>
+              <td>{{ r.dueDate.slice(0, 10) }}</td>
+              <td>
+                {{ paidCount(i) }} of {{ circle.members.length - 1 }}
+                ({{ formatBch(paidCount(i) * r.amountSats) }} BCH)
+              </td>
+              <td>
+                <span v-if="meIdx >= 0 && r.recipientNo === meIdx + 1">You receive this round</span>
+                <span v-else-if="meIdx >= 0 && statusFor(i, meIdx + 1) === 'paid'">✅ You paid</span>
+                <button v-else :disabled="!canPay" @click="payRound(r)">
+                  {{ busyRound === r.round ? 'Waiting for wallet...' : 'Pay now' }}
+                </button>
+                <button v-if="busyRound === r.round" @click="cancel">Cancel</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
 
-    <h3>Who has paid</h3>
-    <p>
-      <button :disabled="tracking" @click="refreshStatus">
-        {{ tracking ? 'Reading the blockchain...' : 'Refresh payment status' }}
-      </button>
-      <small v-if="lastTracked"> Last checked: {{ lastTracked }}</small>
-    </p>
-    <p v-if="trackError" role="alert" style="color: #dc2626">{{ trackError }}</p>
+      <h3>Who has paid</h3>
+      <p>
+        <button :disabled="tracking" @click="refreshStatus">
+          {{ tracking ? 'Reading the blockchain...' : 'Refresh payment status' }}
+        </button>
+        <small v-if="lastTracked"> Last checked: {{ lastTracked }}</small>
+      </p>
+      <p v-if="trackError" role="alert" style="color: #dc2626">{{ trackError }}</p>
 
-    <div style="overflow-x: auto">
-      <table border="1" cellpadding="6">
-        <thead>
-          <tr>
-            <th>Round (receiver)</th>
-            <th v-for="(m, j) in circle.members" :key="j">{{ m.name }}</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="(r, i) in rounds" :key="r.round">
-            <td>{{ r.round }} ({{ r.recipient.name }})</td>
-            <td v-for="(m, j) in circle.members" :key="j" style="text-align: center">
-              <span v-if="cellStatus(i, j) === 'self'" title="Receiver">—</span>
-              <span v-else-if="cellStatus(i, j) === 'paid'" :title="paid[i][j + 1].txid">✅</span>
-              <span v-else-if="cellStatus(i, j) === 'late'" style="color: #dc2626">⚠ Late</span>
-              <span v-else>⏳</span>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-    <p>
-      <small>
-        ✅ paid, ⏳ not yet due, ⚠ late, — receives this round. A payment counts when the
-        blockchain shows it reached the receiver with this circle's note and at least the agreed amount.
-      </small>
-    </p>
+      <div style="overflow-x: auto">
+        <table border="1" cellpadding="6">
+          <thead>
+            <tr>
+              <th>Round (receiver)</th>
+              <th v-for="r in rounds" :key="r.round">{{ r.recipient.name }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(r, i) in rounds" :key="r.round">
+              <td>{{ r.round }} ({{ r.recipient.name }})</td>
+              <td v-for="(c, j) in rounds" :key="c.round" style="text-align: center">
+                <span v-if="cellStatus(i, j) === 'self'" title="Receiver">—</span>
+                <span v-else-if="cellStatus(i, j) === 'paid'" :title="paid[i][c.recipientNo].txid">✅</span>
+                <span v-else-if="cellStatus(i, j) === 'late'" style="color: #dc2626">⚠ Late</span>
+                <span v-else>⏳</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        <small>
+          ✅ paid, ⏳ not yet due, ⚠ late, — receives this round. A payment counts when the
+          blockchain shows it reached the receiver with this circle's note and at least the agreed amount.
+        </small>
+      </p>
+    </template>
 
     <p v-if="errorText" role="alert" style="color: #dc2626">{{ errorText }}</p>
     <p v-if="lastTx" style="overflow-wrap: anywhere">

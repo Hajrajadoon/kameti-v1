@@ -7,40 +7,44 @@ import {
   createCircle,
   encodeCircle,
   decodeCircle,
-  shuffled,
   MIN_MEMBERS,
   MAX_MEMBERS,
 } from './circle.js'
+import { getHeight } from './draw.js'
 import { ADDRESS_PREFIX } from './config.js'
 import WalletConnect from './components/WalletConnect.vue'
 import CircleView from './components/CircleView.vue'
 
-// Open a circle from the share link (old-format links are ignored)
-const hash = location.hash.slice(1)
-const circle = ref(
-  hash
-    ? (() => {
-        try {
-          const c = decodeCircle(hash)
-          return c && c.unit && c.members ? c : null
-        } catch {
-          return null
-        }
-      })()
-    : null,
-)
+// A shared link is data from someone else, so it is fully checked before it is used
+function openFromLink() {
+  const hash = location.hash.slice(1)
+  if (!hash) return null
+  try {
+    const c = decodeCircle(hash)
+    return validate(c).length === 0 ? c : null
+  } catch {
+    return null
+  }
+}
+
+const circle = ref(openFromLink())
+const badLink = ref(Boolean(location.hash.slice(1)) && !circle.value)
 
 const name = ref('')
 const amountBch = ref('0.0001')
 const every = ref(1)
 const unit = ref('months')
 const startDate = ref(new Date().toISOString().slice(0, 10))
+const orderMode = ref('draw') // 'draw' = blockchain dice draw, 'manual' = list order, 'demo' = instant demo draw
+const drawLead = ref(3) // how many blocks ahead the draw block is
 const members = ref([
   { name: '', address: '' },
   { name: '', address: '' },
   { name: '', address: '' },
 ])
 const errors = ref([])
+const creating = ref(false)
+const copyError = ref('')
 
 const shareLink = computed(() =>
   circle.value ? `${location.origin}${location.pathname}#${encodeCircle(circle.value)}` : '',
@@ -53,7 +57,7 @@ const summary = computed(() => {
   return `${n} members, ${n} rounds. Each member pays ${satsToBch(sats)} BCH per round, and the member whose turn it is receives ${satsToBch(sats * n)} BCH in total (${n - 1} payments from others plus their own share).`
 })
 
-function create() {
+async function create() {
   const input = {
     name: name.value,
     members: members.value.map(m => ({ name: m.name.trim(), address: m.address.trim() })),
@@ -64,8 +68,39 @@ function create() {
   }
   errors.value = validate(input)
   if (errors.value.length) return
-  circle.value = createCircle(input)
+
+  let drawHeight = 0
+  if (orderMode.value === 'draw' || orderMode.value === 'demo') {
+    creating.value = true
+    try {
+      // demo = a block that already exists, so the order appears immediately
+      const lead = orderMode.value === 'demo' ? -2 : Number(drawLead.value)
+      drawHeight = (await getHeight()) + lead
+    } catch (e) {
+      console.error(e)
+      errors.value = ['Could not read the blockchain to schedule the draw. Check your connection and try again.']
+      creating.value = false
+      return
+    }
+    creating.value = false
+  }
+
+  circle.value = createCircle({ ...input, drawHeight, demo: orderMode.value === 'demo' })
+  badLink.value = false
   location.hash = encodeCircle(circle.value)
+}
+
+// Turns the circle on screen into an instant demo circle (same members and settings)
+async function makeDemoCopy() {
+  copyError.value = ''
+  try {
+    const height = await getHeight()
+    circle.value = createCircle({ ...circle.value, drawHeight: height - 2, demo: true })
+    location.hash = encodeCircle(circle.value)
+  } catch (e) {
+    console.error(e)
+    copyError.value = 'Could not read the blockchain. Check your connection and try again.'
+  }
 }
 
 function addMember() {
@@ -84,14 +119,10 @@ function move(i, delta) {
   members.value = list
 }
 
-function drawOrder() {
-  if (confirm('Shuffle the payout order at random? Do this live with all members watching.')) {
-    members.value = shuffled(members.value)
-  }
-}
-
 function startOver() {
   circle.value = null
+  badLink.value = false
+  copyError.value = ''
   location.hash = ''
 }
 </script>
@@ -103,9 +134,13 @@ function startOver() {
 
     <WalletConnect />
 
+    <p v-if="badLink" role="alert" style="color: #dc2626">
+      This link is not a valid circle for this network. Ask the organizer for a new link.
+    </p>
+
     <form v-if="!circle" @submit.prevent="create">
       <h2>Create a circle</h2>
-      <input v-model="name" placeholder="Circle name" required />
+      <input v-model="name" placeholder="Circle name" maxlength="60" required />
       <label>Amount per member, per round (BCH) <input v-model="amountBch" /></label>
 
       <div class="row">
@@ -127,21 +162,43 @@ function startOver() {
         </label>
       </div>
 
-      <h3>Members in payout order</h3>
-      <p>
+      <h3>Who receives first?</h3>
+      <label>
+        <span><input type="radio" value="draw" v-model="orderMode" /> Dice draw by the blockchain (recommended)</span>
+      </label>
+      <label>
+        <span><input type="radio" value="manual" v-model="orderMode" /> Set by hand (the list order below is the payout order)</span>
+      </label>
+      <label>
+        <span><input type="radio" value="demo" v-model="orderMode" /> Instant demo draw (demos only, not fair for real circles)</span>
+      </label>
+
+      <label v-if="orderMode === 'draw'">
+        Draw happens
+        <select v-model.number="drawLead">
+          <option :value="1">after 1 block (testing)</option>
+          <option :value="3">after about 3 blocks (about 30 minutes)</option>
+          <option :value="6">after about 6 blocks (about 1 hour)</option>
+          <option :value="12">after about 12 blocks (about 2 hours)</option>
+        </select>
+      </label>
+      <p v-if="orderMode === 'draw'">
         <small>
-          The list below is the payout order: the first member receives in round 1, the second in
-          round 2, and so on. Agree the order together (priority or need), or use the random draw
-          while everyone is watching.
+          The order is decided by a future block's hash, which nobody can predict or control.
+          Everyone must open the link and check the member list before the draw. Set the
+          first round date after the draw.
         </small>
       </p>
 
+      <h3>Members</h3>
       <div v-for="(m, i) in members" :key="i" class="member">
         <span class="num">{{ i + 1 }}</span>
-        <input v-model="m.name" :placeholder="`Member ${i + 1} name`" />
+        <input v-model="m.name" :placeholder="`Member ${i + 1} name`" maxlength="40" />
         <input v-model="m.address" :placeholder="`${ADDRESS_PREFIX}:q...`" />
-        <button type="button" @click="move(i, -1)" :disabled="i === 0" title="Move up">↑</button>
-        <button type="button" @click="move(i, 1)" :disabled="i === members.length - 1" title="Move down">↓</button>
+        <template v-if="orderMode === 'manual'">
+          <button type="button" @click="move(i, -1)" :disabled="i === 0" title="Move up">↑</button>
+          <button type="button" @click="move(i, 1)" :disabled="i === members.length - 1" title="Move down">↓</button>
+        </template>
         <button
           type="button"
           @click="removeMember(i)"
@@ -152,19 +209,21 @@ function startOver() {
 
       <div class="row">
         <button type="button" @click="addMember" :disabled="members.length >= MAX_MEMBERS">+ Add member</button>
-        <button type="button" @click="drawOrder">🎲 Random draw</button>
       </div>
 
       <p v-if="summary"><small>{{ summary }}</small></p>
 
-      <button type="submit">Create circle</button>
+      <button type="submit" :disabled="creating">
+        {{ creating ? 'Reading the blockchain...' : 'Create circle' }}
+      </button>
       <ul style="color: #b00">
         <li v-for="e in errors" :key="e">{{ e }}</li>
       </ul>
     </form>
 
     <div v-else>
-      <CircleView :circle="circle" />
+      <CircleView :key="shareLink" :circle="circle" @demo-copy="makeDemoCopy" />
+      <p v-if="copyError" role="alert" style="color: #dc2626">{{ copyError }}</p>
       <p>Share this link with the other members. Everyone opens the same link and connects their own wallet:</p>
       <input :value="shareLink" readonly style="width: 100%" />
       <p v-if="shareLink.length > 2000">
@@ -179,6 +238,7 @@ function startOver() {
 form { display: grid; gap: 0.75rem; }
 label { display: grid; gap: 0.25rem; }
 input, select { padding: 0.5rem; font-size: 1rem; }
+input[type='radio'] { padding: 0; margin-right: 0.4rem; }
 .row { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: end; }
 .member { display: flex; gap: 0.4rem; align-items: center; }
 .member .num { width: 1.5rem; text-align: right; }
