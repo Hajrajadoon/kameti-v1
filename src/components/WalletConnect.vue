@@ -6,12 +6,9 @@ import {
 } from '@paytaca/wizardconnect-vue'
 
 import { NETWORK } from '../config.js'
-import {
-  deriveAddress,
-  scanWallet,
-  formatBch,
-} from '../chain.js'
-  import TestPayment from './TestPayment.vue'
+import { deriveAddress, scanWallet, formatBch } from '../chain.js'
+import { wallet } from '../store.js'
+import TestPayment from './TestPayment.vue'
 
 const {
   state,
@@ -53,6 +50,8 @@ function resetWallet() {
   walletReady.value = false
   walletAddress.value = ''
   addressError.value = ''
+  wallet.manager = null
+  wallet.ready = false
   resetBalance()
 }
 
@@ -67,23 +66,25 @@ function refreshAddress(m) {
     walletAddress.value = address
     addressError.value = ''
     walletReady.value = true
+    wallet.manager = m
+    wallet.ready = true
   } catch (e) {
     console.error('Could not derive wallet address:', e)
     walletAddress.value = ''
     addressError.value = e?.message || 'Could not read wallet address.'
     walletReady.value = false
+    wallet.manager = null
+    wallet.ready = false
   }
 }
 
 function attachWallet(m) {
   if (!m || m === attachedTo) return
 
-  // Remove listeners from the previous manager.
   if (attachedTo) {
     if (walletReadyHandler) {
       attachedTo.removeListener?.('walletready', walletReadyHandler)
     }
-
     if (disconnectHandler) {
       attachedTo.removeListener?.('disconnect', disconnectHandler)
     }
@@ -102,7 +103,6 @@ function attachWallet(m) {
   m.addListener('walletready', walletReadyHandler)
   m.addListener('disconnect', disconnectHandler)
 
-  // The manager may already be ready when the watcher runs.
   if (state.value === 'connected' || walletReady.value) {
     refreshAddress(m)
   }
@@ -110,20 +110,21 @@ function attachWallet(m) {
 
 watch(manager, attachWallet, { immediate: true })
 
-watch(state, currentState => {
-  console.log('WizardConnect state:', currentState)
+watch(
+  state,
+  currentState => {
+    console.log('WizardConnect state:', currentState)
 
-  if (currentState === 'connected' && manager.value) {
-    refreshAddress(manager.value)
-  }
+    if (currentState === 'connected' && manager.value) {
+      refreshAddress(manager.value)
+    }
 
-  if (
-    currentState === 'disconnected' ||
-    currentState === 'disconnected_by_user'
-  ) {
-    resetWallet()
-  }
-}, { immediate: true })
+    if (currentState === 'disconnected' || currentState === 'disconnected_by_user') {
+      resetWallet()
+    }
+  },
+  { immediate: true },
+)
 
 async function checkBalance() {
   const m = manager.value
@@ -137,18 +138,14 @@ async function checkBalance() {
   scanError.value = ''
 
   try {
-    // Recheck the receive address before scanning.
     refreshAddress(m)
 
     if (!walletAddress.value) {
-      throw new Error(
-        addressError.value || 'Could not obtain a valid wallet address.',
-      )
+      throw new Error(addressError.value || 'Could not obtain a valid wallet address.')
     }
 
     const result = await scanWallet(m, 20)
 
-    // Do not display stale results if the wallet changed during scanning.
     if (manager.value !== m) return
 
     totalSats.value = result.totalSats
@@ -157,8 +154,7 @@ async function checkBalance() {
     lastChecked.value = new Date().toLocaleTimeString()
   } catch (e) {
     console.error('Balance lookup failed:', e)
-    scanError.value =
-      'Could not check balance: ' + (e?.message || String(e))
+    scanError.value = 'Could not check balance: ' + (e?.message || String(e))
   } finally {
     scanning.value = false
   }
@@ -174,7 +170,6 @@ onBeforeUnmount(() => {
     if (walletReadyHandler) {
       attachedTo.removeListener?.('walletready', walletReadyHandler)
     }
-
     if (disconnectHandler) {
       attachedTo.removeListener?.('disconnect', disconnectHandler)
     }
@@ -195,10 +190,7 @@ onBeforeUnmount(() => {
         <strong v-if="walletName">: {{ walletName }}</strong>
       </p>
 
-      <p
-        v-if="walletAddress"
-        style="overflow-wrap: anywhere"
-      >
+      <p v-if="walletAddress" style="overflow-wrap: anywhere">
         Receive address #0:
         <code>{{ walletAddress }}</code>
       </p>
@@ -207,10 +199,7 @@ onBeforeUnmount(() => {
         {{ addressError }}
       </p>
 
-      <button
-        @click="checkBalance"
-        :disabled="scanning || !walletAddress"
-      >
+      <button @click="checkBalance" :disabled="scanning || !walletAddress">
         {{ scanning ? 'Checking balance...' : 'Refresh balance' }}
       </button>
 
@@ -218,25 +207,17 @@ onBeforeUnmount(() => {
         {{ scanError }}
       </p>
 
-      <section
-        v-if="totalSats !== null"
-        class="balance"
-        aria-live="polite"
-      >
+      <section v-if="totalSats !== null" class="balance" aria-live="polite">
         <h3>Wallet balance</h3>
 
         <p>
-          <strong style="font-size: 1.5rem">
-            {{ formatBch(totalSats) }} BCH
-          </strong>
+          <strong style="font-size: 1.5rem">{{ formatBch(totalSats) }} BCH</strong>
         </p>
 
         <p>Unspent ordinary BCH outputs: {{ coins.length }}</p>
         <p>Addresses scanned: {{ scannedAddressCount }}</p>
 
-        <p v-if="lastChecked">
-          Last checked: {{ lastChecked }}
-        </p>
+        <p v-if="lastChecked">Last checked: {{ lastChecked }}</p>
 
         <p>
           <small>
@@ -262,20 +243,24 @@ onBeforeUnmount(() => {
           </ul>
         </details>
 
-        <p v-else>
-          No ordinary BCH outputs were found in the scanned addresses.
-        </p>
+        <p v-else>No ordinary BCH outputs were found in the scanned addresses.</p>
       </section>
-        <TestPayment
-    v-if="totalSats !== null && coins.length"
-    :manager="manager"
-    :coins="coins"
-    @sent="checkBalance"
-  />
 
-      <button @click="handleDisconnect">
-        Disconnect
-      </button>
+      <TestPayment
+        v-if="totalSats !== null && coins.length"
+        :manager="manager"
+        :coins="coins"
+        @sent="checkBalance"
+      />
+
+      <p>
+        <small>
+          If your wallet does not respond to a request, check that your phone's
+          date and time are set to automatic.
+        </small>
+      </p>
+
+      <button @click="handleDisconnect">Disconnect</button>
     </div>
 
     <div v-else>
@@ -283,17 +268,11 @@ onBeforeUnmount(() => {
         Reconnecting to your wallet... Keep the wallet app open.
       </p>
 
-      <button
-        v-else
-        @click="connect()"
-        :disabled="state === 'connecting'"
-      >
+      <button v-else @click="connect()" :disabled="state === 'connecting'">
         {{ state === 'connecting' ? 'Connecting...' : 'Connect Wallet' }}
       </button>
 
-      <p v-if="state === 'connecting'">
-        Waiting for your wallet to connect...
-      </p>
+      <p v-if="state === 'connecting'">Waiting for your wallet to connect...</p>
 
       <p v-if="error" role="alert" style="color: #dc2626">
         {{ error }}

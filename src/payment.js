@@ -10,23 +10,23 @@ import {
 import { provider, deriveAddress, validateAddress } from './chain.js'
 
 const DUST = 546n // smallest output the network accepts
-const MAX_TEST_SATS = 100_000n // 0.001 BCH safety cap for the test form
+const MAX_TEST_SATS = 100_000n // default safety cap: 0.001 BCH
 const FEE_PER_BYTE = 1.2 // slightly above the 1 sat/byte minimum
 
-function estimateFee(inputCount, outputCount) {
-  const size = 10 + inputCount * 150 + outputCount * 40
+function estimateFee(inputCount, outputCount, extraBytes = 0) {
+  const size = 10 + inputCount * 150 + outputCount * 40 + extraBytes
   return BigInt(Math.ceil(size * FEE_PER_BYTE))
 }
 
 // Pick the biggest coins first so the transaction stays small
-function selectCoins(coins, amountSats) {
+function selectCoins(coins, amountSats, extraBytes = 0) {
   const sorted = [...coins].sort((a, b) => (a.satoshis > b.satoshis ? -1 : 1))
   const chosen = []
   let total = 0n
   for (const coin of sorted) {
     chosen.push(coin)
     total += coin.satoshis
-    const fee = estimateFee(chosen.length, 2)
+    const fee = estimateFee(chosen.length, 2, extraBytes)
     if (total >= amountSats + fee) return { chosen, total, fee }
   }
   throw new Error('Not enough BCH to cover the amount plus the network fee.')
@@ -78,6 +78,10 @@ function watchMessages(manager) {
   }
 }
 
+/**
+ * extra.opReturn : optional list of text chunks written into the payment as a note
+ * extra.maxSats  : safety cap for this payment (defaults to 0.001 BCH)
+ */
 export async function sendPayment(
   manager,
   coins,
@@ -85,13 +89,20 @@ export async function sendPayment(
   amountSats,
   prompt = 'Kameti payment',
   signal,
+  extra = {},
 ) {
+  const { opReturn = null, maxSats = MAX_TEST_SATS } = extra
   const to = validateAddress(toAddress)
 
   if (amountSats < DUST) throw new Error('Amount is below the minimum of 546 satoshis.')
-  if (amountSats > MAX_TEST_SATS) throw new Error('The test form is limited to 0.001 BCH.')
+  if (amountSats > maxSats) {
+    throw new Error(
+      `Amount is above the safety limit of ${(Number(maxSats) / 1e8).toFixed(8)} BCH.`,
+    )
+  }
 
-  const { chosen, total, fee } = selectCoins(coins, amountSats)
+  const extraBytes = opReturn ? 60 : 0
+  const { chosen, total, fee } = selectCoins(coins, amountSats, extraBytes)
 
   // Change goes back to a change address of the same wallet
   const changeIndex = pickChangeIndex(manager)
@@ -111,6 +122,7 @@ export async function sendPayment(
     )
   }
   builder.addOutput({ to, amount: amountSats })
+  if (opReturn) builder.addOpReturnOutput(opReturn)
   if (change >= DUST) builder.addOutput({ to: changeAddress, amount: change })
 
   const wc = await builder.generateWcTransactionObject({ broadcast: true, userPrompt: prompt })
@@ -118,12 +130,9 @@ export async function sendPayment(
   // [inputIndex, 'receive' | 'change', addressIndex] for every input the wallet must sign
   const inputPaths = chosen.map((coin, i) => [i, coin.path, coin.index])
 
-  console.log('Manager methods:', Object.getOwnPropertyNames(Object.getPrototypeOf(manager)))
   console.log('Input paths:', JSON.stringify(inputPaths))
   if (typeof manager.signTransaction !== 'function') {
-    throw new Error(
-      'This version of the WizardConnect library has no signTransaction. Update it and try again.',
-    )
+    throw new Error('This version of the WizardConnect library has no signTransaction.')
   }
 
   let response
