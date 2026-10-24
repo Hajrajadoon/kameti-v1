@@ -7,6 +7,7 @@ import { circleId, getRounds, DEFAULT_WINDOW_DAYS } from '../circle.js'
 import { trackPayments, isLate } from '../tracking.js'
 import { getHeight, getBlockHash, drawOrder, DRAW_CONFIRMATIONS } from '../draw.js'
 import { fetchEvents, resolveEvents } from '../events.js'
+import { windowText, buildCalendar, downloadText } from '../reminders.js'
 import { NETWORK } from '../config.js'
 import EventsPanel from './EventsPanel.vue'
 
@@ -17,8 +18,10 @@ defineEmits(['demo-copy'])
 
 // Safety cap per payment. Raise it deliberately before real use on mainnet.
 const MAX_CIRCLE_SATS = 5_000_000n // 0.05 BCH
+const FEE_BUFFER_SATS = 1000n // rough allowance for the network fee of one payment
 
-const meIdx = ref(-1) // position of the connected wallet in the member list, -1 = unknown
+const meIdx = ref(-1) // member found from the connected wallet, -1 = the wallet is not a member
+const previewIdx = ref(-1) // view-only choice when no wallet is connected
 const busyRound = ref(null)
 const errorText = ref('')
 const lastTx = ref('')
@@ -29,6 +32,11 @@ const tracking = ref(false)
 const trackError = ref('')
 const lastTracked = ref('')
 const circleIdText = ref('')
+
+// balance check for reminders
+const balanceInfo = ref(null)
+const balanceBusy = ref(false)
+const balanceError = ref('')
 
 // circle changes (join, leave, swap) read from the blockchain
 const ev = ref(null)
@@ -67,6 +75,11 @@ const effCircle = computed(() =>
 )
 const effOrder = computed(() => (ev.value ? ev.value.order : baseOrder.value))
 const rounds = computed(() => getRounds(effCircle.value, effOrder.value))
+
+// who the page shows "You owe" for: the connected wallet's member, else the preview choice
+const viewIdx = computed(() => (meIdx.value >= 0 ? meIdx.value : previewIdx.value))
+const viewActive = computed(() => viewIdx.value >= 0 && effOrder.value.includes(viewIdx.value))
+const isActive = computed(() => meIdx.value >= 0 && effOrder.value.includes(meIdx.value))
 
 async function loadDraw() {
   if (!hasDraw.value) return
@@ -147,15 +160,9 @@ const currentRoundIndex = computed(() => {
   return idx
 })
 
-const isActive = computed(() => meIdx.value >= 0 && effOrder.value.includes(meIdx.value))
-
+// paying and posting changes need a real, connected member wallet
 const canPay = computed(
-  () =>
-    wallet.ready &&
-    meIdx.value >= 0 &&
-    isActive.value &&
-    busyRound.value === null &&
-    orderReady.value,
+  () => wallet.ready && isActive.value && busyRound.value === null && orderReady.value,
 )
 
 // 'self' | 'paid' | 'late' | 'pending' for a member number in a round
@@ -174,12 +181,14 @@ function paidCount(roundIdx) {
 }
 
 const myPayments = computed(() => {
-  if (meIdx.value < 0 || !orderReady.value || !isActive.value) return []
-  const no = meIdx.value + 1
+  if (!orderReady.value || !viewActive.value) return []
+  const no = viewIdx.value + 1
   return rounds.value
     .map((r, i) => ({ ...r, idx: i, status: statusFor(i, no) }))
     .filter(r => r.status !== 'self')
 })
+const duePayments = computed(() => myPayments.value.filter(p => p.status !== 'paid'))
+const nextPayment = computed(() => duePayments.value[0] || null)
 
 // Has the connected member already paid someone, or received money? (they cannot leave then)
 const myMoneyMoved = computed(() => {
@@ -207,6 +216,7 @@ async function refreshStatus() {
   }
 }
 
+// Finds the member from the connected wallet. This is the only way to become "me".
 function detectMe() {
   const m = wallet.manager
   if (!m) return
@@ -222,10 +232,11 @@ function detectMe() {
 }
 
 watch(
-  () => wallet.ready,
-  ready => {
-    if (ready) detectMe()
+  [() => wallet.ready, () => wallet.manager],
+  () => {
+    if (wallet.ready) detectMe()
     else meIdx.value = -1
+    balanceInfo.value = null
   },
   { immediate: true },
 )
@@ -253,6 +264,46 @@ function cancel() {
   if (controller) controller.abort('Cancelled by user')
 }
 
+async function checkMyBalance() {
+  balanceError.value = ''
+  balanceInfo.value = null
+  if (!wallet.manager) {
+    balanceError.value = 'Connect your wallet first.'
+    return
+  }
+  balanceBusy.value = true
+  try {
+    const scan = await scanWallet(wallet.manager, 20)
+    const need = duePayments.value.reduce(
+      (sum, p) => sum + BigInt(p.amountSats) + FEE_BUFFER_SATS,
+      0n,
+    )
+    balanceInfo.value = { have: scan.totalSats, need }
+  } catch (e) {
+    console.error('Balance check failed:', e)
+    balanceError.value = 'Could not check your balance: ' + (e?.message || String(e))
+  } finally {
+    balanceBusy.value = false
+  }
+}
+
+function addToCalendar() {
+  if (!duePayments.value.length) return
+  const text = buildCalendar({
+    circleName: props.circle.name,
+    circleId: circleIdText.value,
+    payerNo: viewIdx.value + 1,
+    payments: duePayments.value.map(p => ({
+      round: p.round,
+      to: p.recipient.name,
+      amount: formatBch(p.amountSats),
+      start: p.periodStart,
+      end: p.dueDate,
+    })),
+  })
+  downloadText('kameti-payments.ics', text, 'text/calendar')
+}
+
 async function payRound(round) {
   errorText.value = ''
   lastTx.value = ''
@@ -265,8 +316,8 @@ async function payRound(round) {
     errorText.value = 'Connect your wallet first.'
     return
   }
-  if (meIdx.value < 0 || !isActive.value) {
-    errorText.value = 'Choose which active member you are first.'
+  if (!isActive.value) {
+    errorText.value = 'The connected wallet is not an active member of this circle.'
     return
   }
 
@@ -410,22 +461,27 @@ async function payRound(round) {
       </div>
     </div>
 
-    <div v-if="wallet.ready">
-      <label>
-        I am:
-        <select v-model.number="meIdx">
-          <option :value="-1">Choose your name...</option>
+    <div class="who">
+      <p v-if="wallet.ready && meIdx >= 0">
+        You are <strong>{{ effCircle.members[meIdx].name }}</strong>
+        (found from your connected wallet).
+        <span v-if="!isActive" style="color: #b45309"> You are not an active member any more.</span>
+      </p>
+      <p v-else-if="wallet.ready" style="color: #b45309">
+        The connected wallet is not a member of this circle. You can join if a seat is open.
+      </p>
+      <p v-else><small>Connect your wallet above to pay.</small></p>
+
+      <label v-if="meIdx < 0">
+        Preview as (view only, no payments):
+        <select v-model.number="previewIdx">
+          <option :value="-1">Choose a member...</option>
           <option v-for="(m, i) in effCircle.members" :key="i" :value="i">
             {{ m.name }}{{ effOrder.includes(i) ? '' : ' (left)' }}
           </option>
         </select>
       </label>
-      <p v-if="meIdx < 0" style="color: #b45309">
-        The connected wallet's address is not in this circle's member list. You can join if a seat is open.
-      </p>
-      <p v-else-if="!isActive" style="color: #b45309">You are not an active member of this circle.</p>
     </div>
-    <p v-else><small>Connect your wallet above to pay.</small></p>
 
     <EventsPanel
       v-if="orderReady"
@@ -440,8 +496,19 @@ async function payRound(round) {
     />
 
     <template v-if="orderReady">
-      <div v-if="meIdx >= 0 && isActive" class="owe">
+      <div v-if="viewActive" class="owe">
         <h3>You owe</h3>
+
+        <p v-if="nextPayment" :style="{ color: nextPayment.status === 'late' ? '#dc2626' : 'inherit' }">
+          <strong>Next payment:</strong> round {{ nextPayment.round }}, pay
+          <strong>{{ nextPayment.recipient.name }}</strong>
+          {{ formatBch(nextPayment.amountSats) }} BCH between
+          {{ nextPayment.periodStart.slice(0, 10) }} and {{ nextPayment.dueDate.slice(0, 10) }}.
+          <span v-if="nextPayment.status === 'late'">⚠ This payment is late.</span>
+          <span v-else>({{ windowText(nextPayment.periodStart, nextPayment.dueDate) }})</span>
+        </p>
+        <p v-else>✅ All your payments are done.</p>
+
         <ul>
           <li v-for="r in myPayments" :key="r.round">
             Round {{ r.round }}: pay <strong>{{ r.recipient.name }}</strong>
@@ -451,6 +518,30 @@ async function payRound(round) {
             <span v-else-if="r.status === 'late'" style="color: #dc2626"> ⚠ late</span>
           </li>
         </ul>
+
+        <p>
+          <button :disabled="!duePayments.length" @click="addToCalendar">
+            Add my payment dates to my calendar
+          </button>
+          <button v-if="wallet.ready && meIdx >= 0" :disabled="balanceBusy" @click="checkMyBalance">
+            {{ balanceBusy ? 'Checking...' : 'Check my wallet balance' }}
+          </button>
+        </p>
+        <p v-if="balanceError" role="alert" style="color: #dc2626">{{ balanceError }}</p>
+        <p v-if="balanceInfo">
+          Your wallet has <strong>{{ formatBch(balanceInfo.have) }} BCH</strong>. Your unpaid payments
+          need about <strong>{{ formatBch(balanceInfo.need) }} BCH</strong> including fees.
+          <span v-if="balanceInfo.have >= balanceInfo.need" style="color: #15803d">Your balance is enough. ✅</span>
+          <span v-else style="color: #dc2626">
+            Please add about {{ formatBch(balanceInfo.need - balanceInfo.have) }} BCH to your wallet
+            before the payment dates.
+          </span>
+        </p>
+        <p>
+          <small>
+            Payments are never taken automatically. You approve each one in your own wallet.
+          </small>
+        </p>
       </div>
 
       <h3>Rounds</h3>
@@ -475,8 +566,8 @@ async function payRound(round) {
                 ({{ formatBch(paidCount(i) * r.amountSats) }} BCH)
               </td>
               <td>
-                <span v-if="meIdx >= 0 && r.recipientNo === meIdx + 1">You receive this round</span>
-                <span v-else-if="meIdx >= 0 && isActive && statusFor(i, meIdx + 1) === 'paid'">✅ You paid</span>
+                <span v-if="viewActive && r.recipientNo === viewIdx + 1">You receive this round</span>
+                <span v-else-if="viewActive && statusFor(i, viewIdx + 1) === 'paid'">✅ You paid</span>
                 <button v-else :disabled="!canPay" @click="payRound(r)">
                   {{ busyRound === r.round ? 'Waiting for wallet...' : 'Pay now' }}
                 </button>
