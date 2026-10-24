@@ -9,6 +9,7 @@ import {
   decodeCircle,
   MIN_MEMBERS,
   MAX_MEMBERS,
+  DEFAULT_WINDOW_DAYS,
 } from './circle.js'
 import { getHeight } from './draw.js'
 import { ADDRESS_PREFIX } from './config.js'
@@ -34,9 +35,11 @@ const name = ref('')
 const amountBch = ref('0.0001')
 const every = ref(1)
 const unit = ref('months')
+const payWindow = ref(DEFAULT_WINDOW_DAYS)
 const startDate = ref(new Date().toISOString().slice(0, 10))
 const orderMode = ref('draw') // 'draw' = blockchain dice draw, 'manual' = list order, 'demo' = instant demo draw
 const drawLead = ref(3) // how many blocks ahead the draw block is
+const firstIdx = ref(-1) // priority seat: member who takes round 1 (-1 = nobody)
 const members = ref([
   { name: '', address: '' },
   { name: '', address: '' },
@@ -58,6 +61,7 @@ const summary = computed(() => {
 })
 
 async function create() {
+  const usePriority = orderMode.value !== 'manual' && firstIdx.value >= 0
   const input = {
     name: name.value,
     members: members.value.map(m => ({ name: m.name.trim(), address: m.address.trim() })),
@@ -65,6 +69,8 @@ async function create() {
     startDate: startDate.value,
     every: Number(every.value),
     unit: unit.value,
+    payWindow: Number(payWindow.value),
+    first: usePriority ? firstIdx.value : undefined,
   }
   errors.value = validate(input)
   if (errors.value.length) return
@@ -85,7 +91,12 @@ async function create() {
     creating.value = false
   }
 
-  circle.value = createCircle({ ...input, drawHeight, demo: orderMode.value === 'demo' })
+  circle.value = createCircle({
+    ...input,
+    first: input.first ?? -1,
+    drawHeight,
+    demo: orderMode.value === 'demo',
+  })
   badLink.value = false
   location.hash = encodeCircle(circle.value)
 }
@@ -108,7 +119,11 @@ function addMember() {
 }
 
 function removeMember(i) {
-  if (members.value.length > MIN_MEMBERS) members.value.splice(i, 1)
+  if (members.value.length <= MIN_MEMBERS) return
+  members.value.splice(i, 1)
+  // keep the priority seat pointing at the same person
+  if (firstIdx.value === i) firstIdx.value = -1
+  else if (firstIdx.value > i) firstIdx.value -= 1
 }
 
 function move(i, delta) {
@@ -162,6 +177,22 @@ function startOver() {
         </label>
       </div>
 
+      <label>
+        Everyone pays within the first
+        <select v-model.number="payWindow">
+          <option :value="3">3 days of each round</option>
+          <option :value="5">5 days of each round</option>
+          <option :value="7">7 days of each round (recommended)</option>
+          <option :value="10">10 days of each round</option>
+        </select>
+      </label>
+      <p>
+        <small>
+          All members pay the round's receiver inside this window, so the receiver gets the whole
+          amount at once and not in pieces through the month.
+        </small>
+      </p>
+
       <h3>Who receives first?</h3>
       <label>
         <span><input type="radio" value="draw" v-model="orderMode" /> Dice draw by the blockchain (recommended)</span>
@@ -187,6 +218,21 @@ function startOver() {
           The order is decided by a future block's hash, which nobody can predict or control.
           Everyone must open the link and check the member list before the draw. Set the
           first round date after the draw.
+        </small>
+      </p>
+
+      <label v-if="orderMode !== 'manual'">
+        Priority seat (first turn)
+        <select v-model.number="firstIdx">
+          <option :value="-1">None: the blockchain draw decides everyone</option>
+          <option v-for="(m, i) in members" :key="i" :value="i">{{ m.name || `Member ${i + 1}` }}</option>
+        </select>
+      </label>
+      <p v-if="orderMode !== 'manual' && firstIdx >= 0">
+        <small>
+          This member receives in round 1 and the draw decides everyone else. Use it when someone
+          has an urgent need and the whole group agrees <strong>before</strong> the circle starts.
+          The first receiver carries the most trust, so only agree to it if you know them.
         </small>
       </p>
 

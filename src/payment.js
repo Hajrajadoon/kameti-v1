@@ -81,6 +81,7 @@ function watchMessages(manager) {
 /**
  * extra.opReturn : optional list of text chunks written into the payment as a note
  * extra.maxSats  : safety cap for this payment (defaults to 0.001 BCH)
+ * extra.changeTo : optional address that receives the change (default: a fresh change address)
  */
 export async function sendPayment(
   manager,
@@ -91,7 +92,7 @@ export async function sendPayment(
   signal,
   extra = {},
 ) {
-  const { opReturn = null, maxSats = MAX_TEST_SATS } = extra
+  const { opReturn = null, maxSats = MAX_TEST_SATS, changeTo = null } = extra
   const to = validateAddress(toAddress)
 
   if (amountSats < DUST) throw new Error('Amount is below the minimum of 546 satoshis.')
@@ -101,12 +102,15 @@ export async function sendPayment(
     )
   }
 
-  const extraBytes = opReturn ? 60 : 0
-  const { chosen, total, fee } = selectCoins(coins, amountSats, extraBytes)
+  const noteBytes = opReturn
+    ? 12 + opReturn.reduce((sum, chunk) => sum + new TextEncoder().encode(String(chunk)).length + 1, 0)
+    : 0
+  const { chosen, total, fee } = selectCoins(coins, amountSats, noteBytes)
 
-  // Change goes back to a change address of the same wallet
-  const changeIndex = pickChangeIndex(manager)
-  const changeAddress = deriveAddress(manager, 1, changeIndex)
+  // Change goes back to a change address of the same wallet, unless a target was given
+  const changeAddress = changeTo
+    ? validateAddress(changeTo)
+    : deriveAddress(manager, 1, pickChangeIndex(manager))
   const change = total - amountSats - fee
 
   const builder = new TransactionBuilder({ provider })

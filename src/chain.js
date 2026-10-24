@@ -1,16 +1,30 @@
-
 import { ElectrumNetworkProvider } from 'cashscript'
 import { publicKeyToP2pkhCashAddress } from '@bitauth/libauth'
-import { NETWORK, ADDRESS_PREFIX } from './config.js'
+import { NETWORK, ADDRESS_PREFIX, ELECTRUM_HOST } from './config.js'
 
-export const provider = new ElectrumNetworkProvider(NETWORK, {
-  hostname: 'electrum-chipnet.optnlabs.com',
-})
+// The blockchain data server. See config.js to choose a specific one.
+export const provider = ELECTRUM_HOST
+  ? new ElectrumNetworkProvider(NETWORK, { hostname: ELECTRUM_HOST })
+  : new ElectrumNetworkProvider(NETWORK)
 
 const PATHS = [
   { childIndex: 0, name: 'receive' },
   { childIndex: 1, name: 'change' },
 ]
+
+// Tries a request a few times, because the server connection can drop briefly
+async function withRetry(fn, tries = 3) {
+  let lastError
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fn()
+    } catch (e) {
+      lastError = e
+      await new Promise(resolve => setTimeout(resolve, 800 * (i + 1)))
+    }
+  }
+  throw lastError
+}
 
 /**
  * Convert a wallet public-key result to the byte array expected by libauth.
@@ -207,7 +221,7 @@ export async function scanWallet(manager, count = 20) {
     const results = await Promise.all(
       batch.map(async job => ({
         ...job,
-        utxos: await provider.getUtxos(job.address),
+        utxos: await withRetry(() => provider.getUtxos(job.address)),
       })),
     )
 

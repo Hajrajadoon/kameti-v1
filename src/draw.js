@@ -24,10 +24,11 @@ export async function getBlockHash(height) {
 /**
  * Deterministic shuffle of the positions 0..n-1. The same block hash and circle id
  * always give the same order, so every member (and anyone checking) sees the same result.
- * Roll 1 decides who receives first, roll 2 who receives second, and so on.
+ * If fixedFirst is a position (0..n-1), that member takes round 1 (the agreed priority seat)
+ * and the draw decides everyone else.
  */
-export async function drawOrder(blockHash, id, n) {
-  const order = Array.from({ length: n }, (_, i) => i)
+export async function drawOrder(blockHash, id, n, fixedFirst = -1) {
+  const pool = Array.from({ length: n }, (_, i) => i).filter(i => i !== fixedFirst)
   let counter = 0
 
   // Unbiased random number below `max`, taken from SHA-256 of blockHash, id and a counter
@@ -40,9 +41,9 @@ export async function drawOrder(blockHash, id, n) {
     }
   }
 
-  for (let i = n - 1; i > 0; i--) {
+  for (let i = pool.length - 1; i > 0; i--) {
     const j = await below(i + 1)
-    ;[order[i], order[j]] = [order[j], order[i]]
+    ;[pool[i], pool[j]] = [pool[j], pool[i]]
   }
-  return order
+  return fixedFirst >= 0 ? [fixedFirst, ...pool] : pool
 }
